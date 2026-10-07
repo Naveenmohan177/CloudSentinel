@@ -1,0 +1,464 @@
+import json
+import os
+import shutil
+import subprocess
+
+
+def run_command(command, timeout=15):
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+
+        return {
+            "return_code": result.returncode,
+            "stdout": result.stdout.strip(),
+            "stderr": result.stderr.strip(),
+        }
+
+    except subprocess.TimeoutExpired:
+        return {
+            "return_code": -1,
+            "stdout": "",
+            "stderr": "Command timed out.",
+        }
+
+    except Exception as exc:
+        return {
+            "return_code": -1,
+            "stdout": "",
+            "stderr": str(exc),
+        }
+
+
+def openstack_cli():
+    configured = os.environ.get(
+        "CLOUDSENTINEL_OPENSTACK_CLI"
+    )
+
+    if configured:
+        return configured
+
+    found = shutil.which("openstack")
+
+    if found:
+        return found
+
+    return "openstack"
+
+
+def verify_cinder_volume(volume_id):
+    cli = openstack_cli()
+
+    result = run_command(
+        [
+            cli,
+            "volume",
+            "show",
+            volume_id,
+            "-f",
+            "json",
+        ]
+    )
+
+    if result["return_code"] != 0:
+        return {
+            "check": "cinder_volume",
+            "status": "UNKNOWN",
+            "reason": "OpenStack CLI request failed.",
+            "evidence": result["stderr"],
+        }
+
+    try:
+        data = json.loads(result["stdout"])
+    except json.JSONDecodeError:
+        return {
+            "check": "cinder_volume",
+            "status": "UNKNOWN",
+            "reason": "Unable to parse Cinder response.",
+            "evidence": result["stdout"][:1000],
+        }
+
+    attachments = data.get("attachments") or []
+
+    if isinstance(attachments, str):
+        try:
+            attachments = json.loads(attachments)
+        except Exception:
+            pass
+
+    return {
+        "check": "cinder_volume",
+        "status": "HEALTHY",
+        "volume_status": data.get("status"),
+        "attachments": attachments,
+        "attachment_count": (
+            len(attachments)
+            if isinstance(attachments, list)
+            else 0
+        ),
+        "evidence": data,
+    }
+
+
+def verify_nova_attachment(server_id, volume_id):
+    cli = openstack_cli()
+
+    result = run_command(
+        [
+            cli,
+            "server",
+            "show",
+            server_id,
+            "-f",
+            "json",
+        ]
+    )
+
+    if result["return_code"] != 0:
+        return {
+            "check": "nova_attachment",
+            "status": "UNKNOWN",
+            "reason": "OpenStack CLI request failed.",
+            "evidence": result["stderr"],
+        }
+
+    try:
+        data = json.loads(result["stdout"])
+    except json.JSONDecodeError:
+        return {
+            "check": "nova_attachment",
+            "status": "UNKNOWN",
+            "reason": "Unable to parse Nova response.",
+            "evidence": result["stdout"][:1000],
+        }
+
+    volumes = data.get("volumes_attached") or []
+
+    if isinstance(volumes, str):
+        try:
+            volumes = json.loads(volumes)
+        except Exception:
+            volumes = []
+
+    attached_ids = []
+
+    if isinstance(volumes, list):
+        for item in volumes:
+            if isinstance(item, dict):
+                item_id = (
+                    item.get("id")
+                    or item.get("volume_id")
+                )
+
+                if item_id:
+                    attached_ids.append(item_id)
+
+    status = (
+        "ATTACHED"
+        if volume_id in attached_ids
+        else "NOT_ATTACHED"
+    )
+
+    return {
+        "check": "nova_attachment",
+        "status": status,
+        "volume_id": volume_id,
+        "attached_volume_ids": attached_ids,
+        "evidence": data,
+    }
+
+
+def verify_libvirt_disk(domain, device="vdb"):
+    result = run_command(
+        [
+            "virsh",
+            "domblklist",
+            domain,
+            "--details",
+        ]
+    )
+
+    if result["return_code"] != 0:
+        return {
+            "check": "libvirt_disk",
+            "status": "UNKNOWN",
+            "reason": "libvirt query failed.",
+            "evidence": result["stderr"],
+        }
+
+    disk_found = False
+
+    for line in result["stdout"].splitlines():
+        fields = line.split()
+
+        if device in fields:
+            disk_found = True
+            break
+
+    return {
+        "check": "libvirt_disk",
+        "status": (
+            "ATTACHED"
+            if disk_found
+            else "NOT_ATTACHED"
+        ),
+        "device": device,
+        "evidence": result["stdout"],
+    }
+
+
+def verify_iscsi_session(expected=False):
+    result = run_command(
+        [
+            "bash",
+            "-c",
+            "iscsiadm -m session 2>&1 || true",
+        ]
+    )
+
+    output = result["stdout"]
+
+    if (
+        not output
+        or "No active sessions" in output
+    ):
+        return {
+            "check": "iscsi_session",
+            "status": (
+                "NO_SESSION"
+                if expected
+                else "NOT_APPLICABLE"
+            ),
+            "evidence": (
+                output
+                or "No active iSCSI sessions."
+            ),
+        }
+
+    return {
+        "check": "iscsi_session",
+        "status": "SESSION_PRESENT",
+        "evidence": output,
+    }
+
+
+def build_storage_state(
+    volume_id,
+    server_id,
+    domain,
+):
+    cinder = verify_cinder_volume(
+        volume_id
+    )
+
+    nova = verify_nova_attachment(
+        server_id,
+        volume_id,
+    )
+
+    libvirt = verify_libvirt_disk(
+        domain
+    )
+
+    nova_attached = (
+        nova.get("status") == "ATTACHED"
+    )
+
+    iscsi = verify_iscsi_session(
+        expected=nova_attached
+    )
+
+    return {
+        "cinder": cinder,
+        "nova": nova,
+        "libvirt": libvirt,
+        "iscsi": iscsi,
+    }
+
+
+def analyze_storage_consistency(state):
+    cinder = state["cinder"]
+    nova = state["nova"]
+    libvirt = state["libvirt"]
+    iscsi = state["iscsi"]
+
+    findings = []
+
+    cinder_status = cinder.get(
+        "volume_status"
+    )
+
+    cinder_attached = (
+        cinder.get("attachment_count", 0) > 0
+    )
+
+    nova_attached = (
+        nova.get("status") == "ATTACHED"
+    )
+
+    libvirt_attached = (
+        libvirt.get("status") == "ATTACHED"
+    )
+
+    iscsi_present = (
+        iscsi.get("status")
+        == "SESSION_PRESENT"
+    )
+
+    # ---------------------------------------------------------
+    # Unknown state
+    # ---------------------------------------------------------
+
+    if (
+        cinder.get("status") == "UNKNOWN"
+        or nova.get("status") == "UNKNOWN"
+        or libvirt.get("status") == "UNKNOWN"
+    ):
+        findings.append({
+            "severity": "WARNING",
+            "classification": "VERIFICATION_INCOMPLETE",
+            "message": (
+                "One or more infrastructure layers "
+                "could not be verified."
+            ),
+        })
+
+        return findings
+
+    # ---------------------------------------------------------
+    # Completely consistent unattached state
+    # ---------------------------------------------------------
+
+    if (
+        cinder_status == "available"
+        and not cinder_attached
+        and not nova_attached
+        and not libvirt_attached
+        and not iscsi_present
+    ):
+        findings.append({
+            "severity": "INFO",
+            "classification": "CONSISTENT_UNATTACHED",
+            "message": (
+                "Cinder, Nova, libvirt and iSCSI consistently "
+                "report no active volume attachment."
+            ),
+        })
+
+        return findings
+
+    # ---------------------------------------------------------
+    # Cinder/Nova disagreement
+    # ---------------------------------------------------------
+
+    if cinder_attached and not nova_attached:
+        findings.append({
+            "severity": "HIGH",
+            "classification": "CONTROL_PLANE_INCONSISTENCY",
+            "message": (
+                "Cinder reports an active attachment, "
+                "but Nova does not report the volume attached."
+            ),
+        })
+
+    # ---------------------------------------------------------
+    # Nova says attached but libvirt doesn't
+    # ---------------------------------------------------------
+
+    if nova_attached and not libvirt_attached:
+        findings.append({
+            "severity": "HIGH",
+            "classification": "ATTACHMENT_INCONSISTENCY",
+            "message": (
+                "Nova reports the volume attached, but "
+                "libvirt does not expose the expected disk."
+            ),
+        })
+
+    # ---------------------------------------------------------
+    # Nova says attached but iSCSI absent
+    # ---------------------------------------------------------
+
+    if nova_attached and not iscsi_present:
+        findings.append({
+            "severity": "HIGH",
+            "classification": "ISCSI_PATH_INCONSISTENCY",
+            "message": (
+                "Nova reports the volume attached, but "
+                "no active iSCSI session was detected."
+            ),
+        })
+
+    # ---------------------------------------------------------
+    # libvirt disk without iSCSI
+    # ---------------------------------------------------------
+
+    if libvirt_attached and not iscsi_present:
+        findings.append({
+            "severity": "MEDIUM",
+            "classification": "STORAGE_PATH_INCONSISTENCY",
+            "message": (
+                "libvirt exposes the disk but no active "
+                "iSCSI session was detected."
+            ),
+        })
+
+    if not findings:
+        findings.append({
+            "severity": "INFO",
+            "classification": "NO_CONTRADICTION_DETECTED",
+            "message": (
+                "No cross-layer storage contradiction "
+                "was detected."
+            ),
+        })
+
+    return findings
+
+
+def verify_openstack_storage(
+    volume_id,
+    server_id,
+    domain,
+):
+    state = build_storage_state(
+        volume_id,
+        server_id,
+        domain,
+    )
+
+    findings = analyze_storage_consistency(
+        state
+    )
+
+    if any(
+        item["severity"] == "HIGH"
+        for item in findings
+    ):
+        overall = "INCONSISTENT"
+
+    elif any(
+        item["severity"] == "WARNING"
+        for item in findings
+    ):
+        overall = "UNKNOWN"
+
+    elif any(
+        item["severity"] == "MEDIUM"
+        for item in findings
+    ):
+        overall = "DEGRADED"
+
+    else:
+        overall = "CONSISTENT"
+
+    return {
+        "overall_status": overall,
+        "state": state,
+        "findings": findings,
+    }

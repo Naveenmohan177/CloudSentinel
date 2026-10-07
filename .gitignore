@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+env/
+
+# Secrets
+.env
+*.env
+*.pem
+*.key
+*.crt
+passwords.yml
+/etc/kolla/passwords.yml
+
+# Cloud/OpenStack credentials
+clouds.yaml
+openrc.sh
+admin-openrc.sh
+
+# Runtime data
+reports/
+*.log
+*.retry
+
+# Virtual disks / images
+*.img
+*.qcow2
+*.raw
+*.iso
+
+# OS/editor files
+.DS_Store
+.vscode/
+.idea/
